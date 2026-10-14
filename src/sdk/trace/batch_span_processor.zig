@@ -9,7 +9,8 @@
 //! and exported in batches to improve performance.
 
 const std = @import("std");
-const io = std.Options.debug_io;const otel_api = @import("otel-api");
+const io = std.Options.debug_io;
+const otel_api = @import("otel-api");
 const sdk = struct {
     const Resource = @import("../resource/resource.zig").Resource;
     const trace = struct {
@@ -35,9 +36,13 @@ const BridgeSpanProcessor = processor_zig.BridgeSpanProcessor;
 pub const BatchConfig = struct {
     export_interval_ms: ?u32 = null,
     max_queue_size: ?usize = null,
+    /// Maximum spans per exporter call / OTLP request (default: 512, per spec).
+    max_export_batch_size: ?usize = null,
 };
 
 /// Batch span processor that exports spans at regular intervals
+const QueuedSpan = struct { resource: sdk.Resource, data: sdk.trace.SpanData };
+
 pub const BatchSpanProcessor = struct {
     pub const PipelineStep = @import("../common/pipeline.zig").PipelineStepInstructions(
         BatchSpanProcessor,
@@ -66,7 +71,8 @@ pub const BatchSpanProcessor = struct {
     thread: ?std.Thread,
     export_interval_ms: u32,
     max_queue_size: usize,
-    span_queue: std.ArrayList(struct { resource: sdk.Resource, data: sdk.trace.SpanData }),
+    max_export_batch_size: usize,
+    span_queue: std.ArrayList(QueuedSpan),
 
     /// Initialize a new batch span processor
     /// export_interval_ms: How often to export spans (default: 5000ms = 5s)
@@ -92,6 +98,7 @@ pub const BatchSpanProcessor = struct {
             .thread = null,
             .export_interval_ms = config.export_interval_ms orelse 5000,
             .max_queue_size = config.max_queue_size orelse 2048,
+            .max_export_batch_size = @max(1, config.max_export_batch_size orelse 512),
             .span_queue = .empty,
         };
     }
@@ -272,9 +279,7 @@ pub const BatchSpanProcessor = struct {
             // Temporarily release mutex for export
             self.mutex.unlock(io);
             if (self.exporter) |exporter| {
-                for (spans_to_export) |data_pair| {
-                    _ = exporter.exportSpans(&.{data_pair.data}, data_pair.resource);
-                }
+                self.exportAll(exporter, spans_to_export);
             }
             for (spans_to_export) |data_pair| {
                 data_pair.data.deinitOwned(self.allocator);
@@ -322,9 +327,7 @@ pub const BatchSpanProcessor = struct {
         self.mutex.unlock(io);
 
         if (self.exporter) |exporter| {
-            for (spans_to_export) |item| {
-                _ = exporter.exportSpans(&.{item.data}, item.resource);
-            }
+            self.exportAll(exporter, spans_to_export);
         }
 
         for (spans_to_export) |span| {
@@ -337,6 +340,34 @@ pub const BatchSpanProcessor = struct {
     }
 
     /// Export all queued spans (acquires mutex)
+    /// Export queued spans in batches of at most `max_export_batch_size`, one
+    /// exporter call (one OTLP request) per batch.
+    ///
+    /// All spans in a batch are sent under the first span's resource: a
+    /// processor is registered with exactly one TracerProvider, and every span
+    /// it sees carries that provider's resource (onEnd clones it per span, so
+    /// pointer identity is not a usable grouping key).
+    ///
+    /// Before this, every span was its own exporter call, i.e. one HTTP round
+    /// trip per span: at a few hundred spans/s the export thread fell minutes
+    /// behind, the queue capped at max_queue_size, and newer spans were dropped.
+    fn exportAll(self: *BatchSpanProcessor, exporter: SpanExporter, items: []const QueuedSpan) void {
+        if (items.len == 0) return;
+        const datas = self.allocator.alloc(sdk.trace.SpanData, @min(items.len, self.max_export_batch_size)) catch {
+            for (items) |item| _ = exporter.exportSpans(&.{item.data}, item.resource);
+            return;
+        };
+        defer self.allocator.free(datas);
+
+        var head: usize = 0;
+        while (head < items.len) {
+            const n = @min(datas.len, items.len - head);
+            for (datas[0..n], items[head .. head + n]) |*d, item| d.* = item.data;
+            _ = exporter.exportSpans(datas[0..n], items[head].resource);
+            head += n;
+        }
+    }
+
     fn exportBatch(self: *BatchSpanProcessor) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -390,9 +421,7 @@ pub const BatchSpanProcessor = struct {
             // Export outside the lock — HTTP calls can take seconds
             if (spans_to_export) |spans| {
                 if (self.exporter) |exporter| {
-                    for (spans) |item| {
-                        _ = exporter.exportSpans(&.{item.data}, item.resource);
-                    }
+                    self.exportAll(exporter, spans);
                 }
                 for (spans) |span| {
                     span.data.deinitOwned(self.allocator);
@@ -577,6 +606,54 @@ test "BatchSpanProcessor - queue overflow drops newest" {
     processor.mutex.lockUncancelable(io);
     try testing.expectEqual(@as(usize, 2), processor.span_queue.items.len); // Still 2
     processor.mutex.unlock(io);
+}
+
+test "BatchSpanProcessor - one exporter call per batch, capped at max_export_batch_size" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var mock_error_handler = otel_api.common.MockErrorHandler.init(allocator);
+    defer mock_error_handler.deinit();
+    otel_api.common.setMockErrorHandler(&mock_error_handler);
+    defer otel_api.common.clearMockErrorHandler();
+
+    const mock_exporter = try allocator.create(MockSpanExporter);
+    mock_exporter.* = MockSpanExporter.init(allocator);
+
+    const processor = try allocator.create(BatchSpanProcessor);
+    // Never started: the export thread does not run, forceFlush drains.
+    processor.* = BatchSpanProcessor.init(
+        allocator,
+        mock_exporter.spanExporter(),
+        .{ .export_interval_ms = 1_000_000, .max_queue_size = 64, .max_export_batch_size = 4 },
+    );
+
+    const resource = try sdk.Resource.initOwned(allocator, .{ .attributes = &.{} });
+    var provider = @import("tracer_provider.zig").TracerProvider.init(allocator, resource, .{ .random = .init() }, .keep);
+    defer provider.deinit();
+    try provider.registerProcessor(processor.spanProcessor());
+    const tracer = try provider.getTracerWithScope(.empty);
+
+    // 10 spans with batch size 4 ⇒ 3 exporter calls (4 + 4 + 2), not 10.
+    var i: u8 = 0;
+    while (i < 10) : (i += 1) {
+        const span_context = otel_api.trace.Span.Context{
+            .trace_id = otel_api.common.TraceId{ .bytes = [_]u8{i + 1} ** 16 },
+            .span_id = otel_api.common.SpanId{ .bytes = [_]u8{i + 1} ** 8 },
+            .trace_flags = 0,
+            .trace_state = null,
+            .is_remote = false,
+        };
+        const span_ctx = try otel_api.trace.trace_context.withActiveSpanContext(allocator, &.{}, span_context);
+        defer otel_api.ContextKeyValue.deinitOwnedSlice(allocator, span_ctx);
+        var span = try tracer.startSpan("batched", .{}, span_ctx);
+        defer span.deinit();
+        span.end(null);
+    }
+
+    try testing.expectEqual(.success, processor.forceFlush(null));
+    try testing.expectEqual(@as(usize, 10), mock_exporter.exported_spans.items.len);
+    try testing.expectEqual(@as(usize, 3), mock_exporter.export_calls);
 }
 
 test "BatchSpanProcessor - shutdown behavior" {

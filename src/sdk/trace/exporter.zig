@@ -129,6 +129,8 @@ pub const MockSpanExporter = struct {
 
     allocator: std.mem.Allocator,
     exported_spans: std.ArrayList(SpanData),
+    /// Number of exportSpans calls, i.e. OTLP requests a real exporter would make.
+    export_calls: usize = 0,
     export_result: ExportResult,
     flush_result: ExportResult,
     shutdown_result: ExportResult,
@@ -153,6 +155,7 @@ pub const MockSpanExporter = struct {
 
     pub fn exportSpans(self: *MockSpanExporter, spans: []const SpanData, resource: Resource) ExportResult {
         _ = resource;
+        self.export_calls += 1;
         for (spans) |span| {
             // Store reference to span since the exporter needs to own the data
             self.exported_spans.append(self.allocator, span) catch return .failure;
