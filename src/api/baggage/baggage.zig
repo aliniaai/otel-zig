@@ -36,9 +36,13 @@ pub const BaggageKeyValue = struct {
     }
 
     pub fn initOwnedSlice(allocator: std.mem.Allocator, unowned: []BaggageKeyValue) ![]BaggageKeyValue {
-        var owned = try allocator.alloc(BaggageKeyValue, unowned.len);
-        for (0..unowned.len) |h| {
-            owned[h] = try initOwned(allocator, unowned[h].key, unowned[h].value, unowned[h].metadata);
+        const owned = try allocator.alloc(BaggageKeyValue, unowned.len);
+        errdefer allocator.free(owned);
+        var done: usize = 0;
+        errdefer for (owned[0..done]) |o| o.deinitOwned(allocator);
+        for (unowned, owned) |u, *o| {
+            o.* = try initOwned(allocator, u.key, u.value, u.metadata);
+            done += 1;
         }
         return owned;
     }

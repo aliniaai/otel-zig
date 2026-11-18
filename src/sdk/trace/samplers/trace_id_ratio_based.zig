@@ -85,7 +85,10 @@ pub const TraceIdRatioBasedSampler = struct {
     /// Make sampling decision based on trace ID hash
     pub fn shouldSample(self: *const TraceIdRatioBasedSampler, params: otel_api.trace.Sampler.Params) otel_api.trace.Sampler.Result {
         const random = blk: {
-            var random = std.mem.bytesToValue(u56, params.trace_id.bytes[otel_api.common.TraceId.length - 7 ..]);
+            // The trace ID's last 7 bytes, big-endian (W3C trace-context level 2). Exactly 7:
+            // `bytesToValue(u56, ...)` loaded a u56's 8 bytes, one past the ID, so on x86_64 a
+            // stray byte landed above bit 56 and every trace sampled.
+            var random = std.mem.readInt(u56, params.trace_id.bytes[otel_api.common.TraceId.length - 7 ..][0..7], .big);
             if (params.parent_ctx) |parent_ctx| if (parent_ctx.trace_state) |trace_state| {
                 var buffer: [otel_api.trace.StateKeyValue.max_pairs]otel_api.trace.StateKeyValue = undefined;
                 const state = otel_api.trace.StateKeyValue.fromString(trace_state, &buffer);

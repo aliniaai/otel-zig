@@ -32,9 +32,13 @@ pub const ContextKeyValue = struct {
     }
 
     pub fn initOwnedSlice(allocator: std.mem.Allocator, unowned: []const ContextKeyValue) ![]ContextKeyValue {
-        var owned = try allocator.alloc(ContextKeyValue, unowned.len);
-        for (0..unowned.len) |h| {
-            owned[h] = try initOwned(allocator, unowned[h]);
+        const owned = try allocator.alloc(ContextKeyValue, unowned.len);
+        errdefer allocator.free(owned);
+        var done: usize = 0;
+        errdefer for (owned[0..done]) |o| o.deinitOwned(allocator);
+        for (unowned, owned) |u, *o| {
+            o.* = try initOwned(allocator, u);
+            done += 1;
         }
         return owned;
     }

@@ -62,6 +62,8 @@ pub const StateKeyValue = struct {
         var count: usize = 0;
         var iter = std.mem.splitScalar(u8, source, ',');
         while (iter.next()) |slice| {
+            // At most 32 members (W3C trace-context): the rest are dropped, never written past `target`.
+            if (count == MAX_KEY_VALUE_PAIRS) break;
             // Find the equals sign
             if (std.mem.indexOf(u8, slice, "=")) |eq_pos| {
                 const entry = StateKeyValue{
@@ -104,11 +106,13 @@ pub const StateKeyValue = struct {
 
     /// Deep copy a StateKeyValue slice. Must call `deinitOwnedSlice` on the return instance.
     pub fn initOwnedSlice(allocator: std.mem.Allocator, unowned: []StateKeyValue) ![]StateKeyValue {
-        var owned = try allocator.alloc(StateKeyValue, unowned.len);
+        const owned = try allocator.alloc(StateKeyValue, unowned.len);
         errdefer allocator.free(owned);
-        for (0..unowned.len) |h| {
-            errdefer if (h > 0) for (0..h - 1) |i| owned[i].deinitOwned(allocator);
-            owned[h] = try initOwned(allocator, unowned[h]);
+        var done: usize = 0;
+        errdefer for (owned[0..done]) |o| o.deinitOwned(allocator);
+        for (unowned, owned) |u, *o| {
+            o.* = try initOwned(allocator, u);
+            done += 1;
         }
         return owned;
     }
