@@ -39,6 +39,13 @@ pub const OtlpTraceExporter = @import("traces.zig").OtlpTraceExporter;
 pub const transport = @import("transport.zig");
 pub const OtlpMetricExporter = @import("metrics.zig").OtlpMetricExporter;
 
+/// The generated OTLP messages, for a caller that decodes what an exporter sent.
+pub const proto = struct {
+    pub const metrics = @import("proto/opentelemetry/proto/metrics/v1.pb.zig");
+    pub const common = @import("proto/opentelemetry/proto/common/v1.pb.zig");
+    pub const resource = @import("proto/opentelemetry/proto/resource/v1.pb.zig");
+};
+
 // Re-export creation functions
 pub const createMetricExporterWithConfig = @import("metrics.zig").createMetricExporterWithConfig;
 pub const createTraceExporter = @import("traces.zig").createTraceExporter;

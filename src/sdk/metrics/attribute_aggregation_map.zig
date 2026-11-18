@@ -20,6 +20,8 @@ pub const AttributeAggregationEntry = struct {
     aggregation: Aggregation,
     attributes: []const api.AttributeKeyValue,
     metadata: sdk.MetricMetadata, // Complete metadata for export
+    /// The series: the instrument's hash and its attributes'. 0 for the overflow entry.
+    key: u128 = 0,
 
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         self.aggregation.deinit(allocator);
@@ -133,10 +135,12 @@ pub const AttributeAggregationMap = struct {
         entry.* = .{
             .aggregation = self.createAggregationForType(metadata, value) catch {
                 // On error, return overflow
+                api.AttributeKeyValue.deinitOwnedSlice(self.allocator, owned_attributes);
                 return &self.overflow_aggregation;
             },
             .attributes = owned_attributes,
             .metadata = metadata,
+            .key = combined_hash,
         };
 
         // Store in map
@@ -159,14 +163,21 @@ pub const AttributeAggregationMap = struct {
             .Counter, .ObservableCounter => switch (value) {
                 .i64 => .{ .sum_i64 = .init() },
                 .f64 => .{ .sum_f64 = .init() },
+                .histogram => error.ValueTypeMismatch,
             },
             .UpDownCounter, .ObservableUpDownCounter => switch (value) {
                 .i64 => .{ .sum_i64 = .init() },
                 .f64 => .{ .sum_f64 = .init() },
+                .histogram => error.ValueTypeMismatch,
             },
             .Gauge, .ObservableGauge => switch (value) {
                 .i64 => .{ .last_value_i64 = .init() },
                 .f64 => .{ .last_value_f64 = .init() },
+                .histogram => error.ValueTypeMismatch,
+            },
+            .ObservableHistogram => switch (value) {
+                .histogram => |point| .{ .observed_histogram = try .init(self.allocator, metadata.histogram_boundaries orelse return error.NoBucketBoundaries, point) },
+                else => error.ValueTypeMismatch,
             },
             .Histogram => blk: {
                 // Use advisory bucket boundaries if provided (Stable)
@@ -178,6 +189,7 @@ pub const AttributeAggregationMap = struct {
                 break :blk switch (value) {
                     .i64 => .{ .histogram_i64 = try .init(self.allocator, config) },
                     .f64 => .{ .histogram_f64 = try .init(self.allocator, config) },
+                    .histogram => error.ValueTypeMismatch,
                 };
             },
         };
@@ -227,12 +239,17 @@ pub const AttributeAggregationMap = struct {
                     hist.counts = try allocator.dupe(std.atomic.Value(u64), hist.counts);
                     hist.boundaries = try allocator.dupe(f64, hist.boundaries);
                 },
+                .observed_histogram => |*hist| {
+                    hist.bucket_counts = try allocator.dupe(u64, hist.bucket_counts);
+                    hist.boundaries = try allocator.dupe(f64, hist.boundaries);
+                },
                 else => {},
             }
             try entry_list.append(allocator, .{
                 .aggregation = aggregation,
                 .attributes = try api.AttributeKeyValue.initOwnedSlice(allocator, entry.attributes),
                 .metadata = entry.metadata,
+                .key = entry.key,
             });
             entry.deinit(self.allocator);
         }

@@ -30,6 +30,7 @@ const TypeErasedCallback = @import("observable_instrument.zig").TypeErasedCallba
 
 // Observable instrument imports
 const ObservableInstrument = @import("observable_instrument.zig").ObservableInstrument;
+const HistogramPoint = @import("observable_instrument.zig").HistogramPoint;
 
 /// Meter interface using tagged union for polymorphism
 pub const Meter = union(enum) {
@@ -278,6 +279,24 @@ pub const Meter = union(enum) {
             },
         };
     }
+
+    /// Create an ObservableHistogram instrument: its callbacks report `HistogramPoint`s,
+    /// running bucket totals the application keeps itself. `advisory` must carry the
+    /// explicit bucket boundaries those totals are counted against (in `unit`); a point
+    /// with any other number of buckets is dropped.
+    pub inline fn createObservableHistogram(
+        self: *const Meter,
+        name: []const u8,
+        description: ?[]const u8,
+        unit: ?[]const u8,
+        advisory: AdvisoryParams,
+        callbacks: []const TypeErasedCallback(HistogramPoint),
+    ) !ObservableInstrument(HistogramPoint) {
+        return switch (self.*) {
+            .noop => ObservableInstrument(HistogramPoint){ .noop = name },
+            .bridge => |*bridge| bridge.createObservableHistogramFn(bridge.meter_ptr, name, description, unit, advisory, callbacks),
+        };
+    }
 };
 
 /// Validate instrument name according to OpenTelemetry requirements
@@ -382,6 +401,7 @@ pub const MeterBridge = struct {
     createObservableGaugeF64Fn: *const fn (meter_ptr: *anyopaque, name: []const u8, description: ?[]const u8, unit: ?[]const u8, advisory: ?AdvisoryParams, callbacks: []const TypeErasedCallback(f64)) anyerror!ObservableInstrument(f64),
     createObservableUpDownCounterI64Fn: *const fn (meter_ptr: *anyopaque, name: []const u8, description: ?[]const u8, unit: ?[]const u8, advisory: ?AdvisoryParams, callbacks: []const TypeErasedCallback(i64)) anyerror!ObservableInstrument(i64),
     createObservableUpDownCounterF64Fn: *const fn (meter_ptr: *anyopaque, name: []const u8, description: ?[]const u8, unit: ?[]const u8, advisory: ?AdvisoryParams, callbacks: []const TypeErasedCallback(f64)) anyerror!ObservableInstrument(f64),
+    createObservableHistogramFn: *const fn (meter_ptr: *anyopaque, name: []const u8, description: ?[]const u8, unit: ?[]const u8, advisory: AdvisoryParams, callbacks: []const TypeErasedCallback(HistogramPoint)) anyerror!ObservableInstrument(HistogramPoint),
 
     pub fn init(ptr: anytype) MeterBridge {
         const T = @TypeOf(ptr);
@@ -444,6 +464,10 @@ pub const MeterBridge = struct {
                 const self: T = @ptrCast(@alignCast(pointer));
                 return ptr_info.pointer.child.createObservableUpDownCounterF64(self, name, description, unit, advisory, callbacks);
             }
+            pub fn createObservableHistogram(pointer: *anyopaque, name: []const u8, description: ?[]const u8, unit: ?[]const u8, advisory: AdvisoryParams, callbacks: []const TypeErasedCallback(HistogramPoint)) anyerror!ObservableInstrument(HistogramPoint) {
+                const self: T = @ptrCast(@alignCast(pointer));
+                return ptr_info.pointer.child.createObservableHistogram(self, name, description, unit, advisory, callbacks);
+            }
         };
 
         return .{
@@ -462,6 +486,7 @@ pub const MeterBridge = struct {
             .createObservableGaugeF64Fn = VTable.createObservableGaugeF64,
             .createObservableUpDownCounterI64Fn = VTable.createObservableUpDownCounterI64,
             .createObservableUpDownCounterF64Fn = VTable.createObservableUpDownCounterF64,
+            .createObservableHistogramFn = VTable.createObservableHistogram,
         };
     }
 };

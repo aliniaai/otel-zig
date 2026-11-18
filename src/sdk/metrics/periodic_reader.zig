@@ -1,16 +1,22 @@
 //! Basic Periodic Metrics Processor
 //!
 //! This module provides a basic metrics processor that collects metrics from registered
-//! meters on a periodic basis using a background thread. It uses POSIX threads
-//! for cross-platform compatibility.
+//! meters on a periodic basis using a background thread.
 //!
 //! The processor maintains a thread that wakes up at regular intervals to collect
 //! metrics from all registered meters and export them via the configured exporter.
+//!
+//! - A cycle is a collection (the observable callbacks, then the aggregation state) and its
+//!   export. Cycles never overlap. The export runs outside the reader's mutex, so
+//!   registering a meter or asking for shutdown never waits on the network.
+//! - An export that succeeds is committed to the aggregation state; one that fails is not,
+//!   and the next cycle's observable deltas cover it.
+//! - `shutdown` wakes the thread at once, lets a cycle in flight finish, runs one last
+//!   cycle inside its timeout and joins. How long that takes is the exporter's to bound.
 
 const std = @import("std");
 const io = std.Options.debug_io;
 const api = @import("otel-api");
-const c = std.c;
 
 const sdk = struct {
     const BridgeReader = @import("reader.zig").BridgeReader;
@@ -42,13 +48,19 @@ pub const PeriodicReader = struct {
 
     allocator: std.mem.Allocator,
     exporter: ?sdk.MetricExporter,
+    /// The registered meters and the collection itself; never held across an export.
     mutex: std.Io.Mutex,
-    condition: std.Io.Condition = std.Io.Condition.init,
+    /// One cycle at a time: the thread's, `collect`'s and `forceFlush`'s.
+    cycle_mutex: std.Io.Mutex,
+    /// Set by `shutdown`: wakes the thread out of its interval.
+    stop: std.Io.Event,
     is_shutdown: std.atomic.Value(bool),
     is_running: std.atomic.Value(bool),
-    collection_in_progress: std.atomic.Value(bool),
-    collection_complete: std.Io.Condition = std.Io.Condition.init,
+    /// The bound on the thread's last cycle (`shutdown`'s timeout); 0: none.
+    final_timeout_ms: std.atomic.Value(u64),
     last_collection_time: std.atomic.Value(i64),
+    /// How long the last collection took (callbacks and aggregation, not the export).
+    last_collection_duration_ns: std.atomic.Value(u64),
     thread: ?std.Thread,
     collection_interval_ms: u32,
     registered_meters: std.ArrayListUnmanaged(*sdk.Meter),
@@ -65,12 +77,13 @@ pub const PeriodicReader = struct {
             .allocator = allocator,
             .exporter = exporter,
             .mutex = std.Io.Mutex.init,
-            .condition = std.Io.Condition.init,
+            .cycle_mutex = std.Io.Mutex.init,
+            .stop = .unset,
             .is_shutdown = std.atomic.Value(bool).init(false),
             .is_running = std.atomic.Value(bool).init(false),
-            .collection_in_progress = std.atomic.Value(bool).init(false),
-            .collection_complete = std.Io.Condition.init,
+            .final_timeout_ms = .init(0),
             .last_collection_time = std.atomic.Value(i64).init(0),
+            .last_collection_duration_ns = .init(0),
             .thread = null,
             .collection_interval_ms = collection_interval_ms orelse 60000, // 60 seconds default
             .registered_meters = .empty,
@@ -87,28 +100,18 @@ pub const PeriodicReader = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
 
-        if (self.is_running.load(.acquire) or self.thread != null) {
+        if (self.is_running.load(.acquire) or self.thread != null or self.is_shutdown.load(.acquire)) {
             return;
         }
 
         self.is_running.store(true, .release);
+        errdefer self.is_running.store(false, .release);
         self.thread = try std.Thread.spawn(.{}, collectionThreadFn, .{self});
     }
 
     /// Stop the background collection thread and clean up resources
     pub fn deinit(self: *PeriodicReader) void {
-        // Signal shutdown
-        self.is_shutdown.store(true, .release);
-        self.is_running.store(false, .release);
-
-        self.mutex.lockUncancelable(io);
-        self.condition.signal(io);
-        self.mutex.unlock(io);
-
-        // Wait for thread to finish
-        if (self.thread) |thread| {
-            thread.join();
-        }
+        _ = self.shutdown(null);
 
         // Clean up resources
         self.reader_state.deinit();
@@ -134,110 +137,88 @@ pub const PeriodicReader = struct {
         self.reader_state.recordMeasurement(value, attributes, metadata, metadata_hash);
     }
 
-    /// Collect metrics from all registered meters.
-    ///
-    /// Must lock mutex before calling.
-    /// collection_in_progress must be false before calling.
-    fn internalCollect(self: *PeriodicReader) void {
+    fn nowNs() i96 {
+        return std.Io.Timestamp.now(io, .awake).nanoseconds;
+    }
+
+    /// One cycle: collect, export within `timeout_ms` (null: the exporter's own limit),
+    /// commit if it arrived.
+    fn cycle(self: *PeriodicReader, timeout_ms: ?u64) api.common.ExportResult {
+        self.cycle_mutex.lockUncancelable(io);
+        defer self.cycle_mutex.unlock(io);
+
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const allocator = arena.allocator();
 
-        // flag that we are in process.
-        if (self.collection_in_progress.swap(true, .acq_rel)) {
-            // It was already already true, so we aren't the first to get here.
-            api.common.reportError(.{
-                .component = .meter,
-                .context = null,
-                .error_type = .internal,
-                .message = "Collection while Collection already in progress.",
-                .operation = "PeriodicReader.internalCollect",
-                .source_error = null,
-            });
-            return;
-        }
+        const collected_metrics = blk: {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            const t0 = nowNs();
+            defer self.last_collection_duration_ns.store(@intCast(@max(nowNs() - t0, 0)), .monotonic);
 
-        // at this point we are the lucky thread that got false when it did the swap above.
-        defer {
-            self.collection_in_progress.store(false, .release);
-            self.collection_complete.broadcast(io);
-        }
-
-        // trigger the observables to write their data to the aggregation state.
-        for (self.registered_meters.items) |meter| {
-            meter.triggerObservables(allocator, self.reader());
-        }
-
-        // Collect all the aggregated metrics.
-        const collected_metrics = self.reader_state.collect(allocator) catch |err| {
-            std.log.err("Failed to collect metrics: {}", .{err});
-            // Log error if needed
-            return;
+            // trigger the observables to write their data to the aggregation state.
+            for (self.registered_meters.items) |meter| {
+                meter.triggerObservables(allocator, self.reader());
+            }
+            // every meter of a reader is its provider's
+            const resource = if (self.registered_meters.items.len > 0) self.registered_meters.items[0].provider.resource else sdk.Resource.empty;
+            break :blk self.reader_state.collect(allocator, resource) catch |err| {
+                api.common.reportError(.{
+                    .component = .meter,
+                    .context = null,
+                    .error_type = .internal,
+                    .message = "Failed to collect metrics",
+                    .operation = "PeriodicReader.cycle",
+                    .source_error = err,
+                });
+                return .failure;
+            };
         };
-        defer allocator.free(collected_metrics);
 
-        // Export all collected metrics. Exporter must copy memory
-        // that it needs beyond the duration of this call.
-        if (self.exporter) |*exporter| _ = exporter.exportMetrics(collected_metrics);
-        // Arena cleans up all the memory.
+        // Exporter must copy memory that it needs beyond the duration of this call.
+        const result: api.common.ExportResult = if (self.exporter) |*exporter| exporter.exportMetricsWithin(collected_metrics, timeout_ms) else .success;
+        if (result == .success) self.reader_state.commit();
+        return result;
     }
 
     pub fn collect(self: *PeriodicReader) void {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-
-        while (self.collection_in_progress.load(.acquire)) {
-            self.collection_complete.waitUncancelable(io, &self.mutex);
-        }
-
-        self.internalCollect();
+        _ = self.cycle(null);
     }
 
-    /// Force flush the exporter
+    /// Collect and export now, then flush the exporter.
     pub fn forceFlush(self: *PeriodicReader, timeout_ms: ?u64) api.common.FlushResult {
-        const start_time = @as(i64, @intCast(@divFloor(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms)));
-
-        // force flush has to cascade to the exporter as well, but we don't need to hold the mutex for that part.
-        {
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-            // Wait for any existing collection to complete
-            while (self.collection_in_progress.load(.acquire)) {
-                if (timeout_ms) |collection_timeout| {
-                    const delta: u64 = @intCast(@as(i64, @intCast(@divFloor(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms))) - start_time);
-                    if (delta >= collection_timeout) return .timeout;
-                    self.collection_complete.waitUncancelable(io, &self.mutex);
-                } else {
-                    self.collection_complete.waitUncancelable(io, &self.mutex);
-                    // block.
-                }
-            }
-            self.internalCollect();
+        const t0 = nowNs();
+        const exported = self.cycle(timeout_ms);
+        if (exported != .success) return exported.asFlushResult();
+        const exporter = self.exporter orelse return .success;
+        if (timeout_ms) |limit| {
+            const spent: u64 = @intCast(@divFloor(@max(nowNs() - t0, 0), std.time.ns_per_ms));
+            if (spent >= limit) return .timeout;
+            return exporter.forceFlush(limit - spent).asFlushResult();
         }
-
-        // Flush the exporter
-        return if (self.exporter) |exporter| blk: {
-            if (timeout_ms) |collection_timeout| {
-                const delta: u64 = @intCast(@as(i64, @intCast(@divFloor(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms))) - start_time);
-                if (delta >= collection_timeout) return .timeout;
-                break :blk exporter.forceFlush(collection_timeout - delta).asFlushResult();
-            } else {
-                break :blk exporter.forceFlush(null).asFlushResult();
-            }
-        } else .success;
+        return exporter.forceFlush(null).asFlushResult();
     }
 
-    /// Shutdown the processor
+    /// Stop collecting: a last cycle, bounded by `timeout_ms`, then the exporter's shutdown.
+    /// Returns once the thread has ended.
     pub fn shutdown(self: *PeriodicReader, timeout_ms: ?u64) api.common.ProcessResult {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-
         if (self.is_shutdown.swap(true, .seq_cst)) {
             return .success;
         }
+        self.final_timeout_ms.store(timeout_ms orelse 0, .release);
+        self.stop.set(io);
 
+        const thread = blk: {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            const t = self.thread;
+            self.thread = null;
+            break :blk t;
+        };
+        // The thread runs the last cycle; a reader that never started one runs it here.
+        if (thread) |t| t.join() else _ = self.cycle(timeout_ms);
         self.is_running.store(false, .release);
-        self.condition.signal(io);
 
         // Shutdown the exporter
         const result = if (self.exporter) |*exporter| exporter.shutdown(timeout_ms) else .success;
@@ -296,39 +277,26 @@ pub const PeriodicReader = struct {
 
     /// Background thread function that periodically collects metrics
     fn collectionThreadFn(self: *PeriodicReader) void {
-        while (true) {
-            // Fast path check without mutex
-            if (self.is_shutdown.load(.acquire)) {
-                break;
-            }
-
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-
-            // Sleep for the collection interval, releasing the mutex
-            const wait_ns: i96 = @intCast(@as(u64, self.collection_interval_ms) * std.time.ns_per_ms);
-            self.mutex.unlock(io);
-            io.sleep(.{ .nanoseconds = wait_ns }, .real) catch {};
-            self.mutex.lockUncancelable(io);
-
-            // > Given timedWait() can be interrupted spuriously, the blocking condition
-            // > should be checked continuously irrespective of any notifications from
-            // > signal() or broadcast().
-            if (self.is_shutdown.load(.acquire)) {
-                break;
-            }
-
-            // Try to acquire collection lock
-            // Is this possible? collection requires the mutex, no?
-            if (self.collection_in_progress.load(.acquire)) {
-                // Already collecting, skip this cycle
+        const interval: i96 = @as(i96, self.collection_interval_ms) * std.time.ns_per_ms;
+        var next = nowNs() + interval;
+        while (!self.stop.isSet()) {
+            // The wait ends early when `stop` is set, and may end early for no reason:
+            // only the clock says a tick is due.
+            const left = next - nowNs();
+            if (left > 0) {
+                self.stop.waitTimeout(io, .{ .duration = .{ .raw = .fromNanoseconds(left), .clock = .awake } }) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => break,
+                };
                 continue;
             }
-
-            // Update last collection time
             self.last_collection_time.store(@as(i64, @intCast(@divFloor(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms))), .release);
-            self.internalCollect();
+            _ = self.cycle(null);
+            // a full interval after each cycle, however long its export took
+            next = nowNs() + interval;
         }
+        const limit = self.final_timeout_ms.load(.acquire);
+        _ = self.cycle(if (limit == 0) null else limit);
     }
 };
 
@@ -491,4 +459,87 @@ test "PeriodicReader and Observable instrument test." {
         }
     }
     try testing.expect(found);
+}
+
+/// An exporter whose exports stay out: the first until `release_first` is set, the later
+/// ones until `release_rest` is; each gives up at its timeout.
+const GateExporter = struct {
+    entered: std.Io.Event = .unset,
+    release_first: std.Io.Event = .unset,
+    release_rest: std.Io.Event = .unset,
+    exports: std.atomic.Value(u32) = .init(0),
+    /// The timeout the last export was given, in ms; maxInt: none.
+    last_timeout_ms: std.atomic.Value(u64) = .init(0),
+
+    pub fn exportMetrics(self: *GateExporter, metrics: []const sdk.MetricData) api.common.ExportResult {
+        return self.exportMetricsWithin(metrics, null);
+    }
+    pub fn exportMetricsWithin(self: *GateExporter, _: []const sdk.MetricData, timeout_ms: ?u64) api.common.ExportResult {
+        const release = if (self.exports.fetchAdd(1, .monotonic) == 0) &self.release_first else &self.release_rest;
+        self.last_timeout_ms.store(timeout_ms orelse std.math.maxInt(u64), .monotonic);
+        self.entered.set(io);
+        if (timeout_ms) |ms| {
+            release.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(@intCast(ms)), .clock = .awake } }) catch return .timeout;
+        } else release.waitUncancelable(io);
+        return .success;
+    }
+    pub fn forceFlush(_: *GateExporter, _: ?u64) api.common.ExportResult {
+        return .success;
+    }
+    pub fn shutdown(_: *GateExporter, _: ?u64) api.common.ExportResult {
+        return .success;
+    }
+    pub fn deinit(_: *GateExporter) void {}
+    pub fn destroy(_: *GateExporter) void {}
+    fn metricExporter(self: *GateExporter) sdk.MetricExporter {
+        return .{ .bridge = @import("exporter.zig").BridgeMetricExporter.init(self) };
+    }
+};
+
+fn elapsedMs(t0: i96) i96 {
+    return @divFloor(std.Io.Timestamp.now(io, .awake).nanoseconds - t0, std.time.ns_per_ms);
+}
+
+test "fork: shutdown wakes the thread out of its interval and sends one last export" {
+    const testing = std.testing;
+    const MockExporter = @import("exporter.zig").MockMetricExporter;
+    const mock_exporter = try testing.allocator.create(MockExporter);
+    mock_exporter.* = MockExporter.init(testing.allocator);
+    // a minute between collections: the old thread slept it out before it could be joined
+    var reader_ = try PeriodicReader.init(testing.allocator, mock_exporter.metricExporter(), 60_000);
+    try reader_.start();
+    try testing.expectEqual(@as(u64, 0), mock_exporter.exportCount());
+
+    const t0 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    try testing.expectEqual(api.common.ProcessResult.success, reader_.shutdown(1000));
+    try testing.expectEqual(@as(u64, 1), mock_exporter.exportCount());
+    reader_.deinit();
+    try testing.expect(elapsedMs(t0) < 1000);
+}
+
+test "fork: an export in flight holds neither the reader's mutex nor its shutdown past the timeout" {
+    const testing = std.testing;
+    var gate: GateExporter = .{};
+    var reader_ = try PeriodicReader.init(testing.allocator, gate.metricExporter(), 20);
+    try reader_.start();
+    // the thread's first export is out, and stays out
+    gate.entered.waitUncancelable(io);
+
+    // what only needs the reader's own state does not wait for it
+    var t0 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    var no_meter: sdk.Meter = undefined;
+    reader_.unregisterMeter(&no_meter);
+    try testing.expect(elapsedMs(t0) < 200);
+    try testing.expectEqual(@as(u32, 1), gate.exports.load(.monotonic));
+
+    // shutdown: the export in flight is let go here (an exporter bounds its own), then the
+    // last one is given the shutdown's timeout
+    t0 = std.Io.Timestamp.now(io, .awake).nanoseconds;
+    gate.release_first.set(io);
+    _ = reader_.shutdown(150);
+    const took = elapsedMs(t0);
+    try testing.expectEqual(@as(u32, 2), gate.exports.load(.monotonic));
+    try testing.expectEqual(@as(u64, 150), gate.last_timeout_ms.load(.monotonic));
+    try testing.expect(took >= 100 and took < 1000);
+    reader_.deinit();
 }

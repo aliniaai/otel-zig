@@ -18,11 +18,27 @@ const Context = @import("../context/root.zig").Context;
 const AttributeKeyValue = @import("../common/root.zig").AttributeKeyValue;
 const reportError = @import("../common/error_handler.zig").reportError;
 
+/// What an ObservableHistogram's callback reports for one attribute set: a distribution the
+/// application keeps itself (its own lock-free buckets, another library's), as running
+/// totals. Like an ObservableCounter's value, it is absolute; the reader turns it into its
+/// temporality.
+pub const HistogramPoint = struct {
+    /// Running total per bucket: one more than the instrument's explicit bucket boundaries,
+    /// the last for everything above the highest. Borrowed, like a measurement's attributes,
+    /// until the collection ends: allocate it with the callback's allocator.
+    bucket_counts: []const u64,
+    /// Running sum of the recorded values.
+    sum: f64,
+    /// The extremes recorded since this callback last ran, when the application knows them.
+    min: ?f64 = null,
+    max: ?f64 = null,
+};
+
 /// Async Instrument for (un-)registering callbacks against.
 pub fn ObservableInstrument(comptime T: type) type {
     comptime switch (T) {
-        i64, f64 => {},
-        else => @compileError("ObservableInstrument must be of type i64 or f64"),
+        i64, f64, HistogramPoint => {},
+        else => @compileError("ObservableInstrument must be of type i64, f64 or HistogramPoint"),
     };
 
     return union(enum) {

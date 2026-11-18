@@ -18,6 +18,8 @@ const sdk = struct {
 pub const MetricValue = union(enum) {
     i64: i64,
     f64: f64,
+    /// An ObservableHistogram's observation: running totals.
+    histogram: api.metrics.HistogramPoint,
 };
 
 /// Metric reader interface

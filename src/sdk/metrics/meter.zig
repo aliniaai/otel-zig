@@ -108,6 +108,7 @@ pub const Meter = struct {
     // Observable instruments - ArrayHashMaps for consistent iteration order
     observables_i64: std.ArrayHashMapUnmanaged(InstrumentIdentity, *sdk.metrics.async_instr.Observable(i64), InstrumentIdentityArrayContext, false),
     observables_f64: std.ArrayHashMapUnmanaged(InstrumentIdentity, *sdk.metrics.async_instr.Observable(f64), InstrumentIdentityArrayContext, false),
+    observables_histogram: std.ArrayHashMapUnmanaged(InstrumentIdentity, *sdk.metrics.async_instr.Observable(api.metrics.HistogramPoint), InstrumentIdentityArrayContext, false),
 
     // Configuration for async instruments
     async_config: sdk.metrics.async_instr.AsyncInstrumentConfig,
@@ -130,7 +131,8 @@ pub const Meter = struct {
             .histograms_f64 = .empty,
             .observables_i64 = .empty,
             .observables_f64 = .empty,
-            .async_config = .default,
+            .observables_histogram = .empty,
+            .async_config = provider.async_config,
         };
     }
 
@@ -146,6 +148,7 @@ pub const Meter = struct {
             &self.histograms_f64,
             &self.observables_i64,
             &self.observables_f64,
+            &self.observables_histogram,
         };
         inline for (all_maps) |map_ptr| {
             var iter = map_ptr.iterator();
@@ -512,6 +515,30 @@ pub const Meter = struct {
         );
     }
 
+    /// An ObservableHistogram: its callbacks report running bucket totals against
+    /// `advisory.explicit_bucket_boundaries`, which it must carry.
+    pub fn createObservableHistogram(
+        self: *Meter,
+        name: []const u8,
+        description: ?[]const u8,
+        unit: ?[]const u8,
+        advisory: api.metrics.AdvisoryParams,
+        callbacks: []const api.metrics.TypeErasedCallback(api.metrics.HistogramPoint),
+    ) !api.metrics.ObservableInstrument(api.metrics.HistogramPoint) {
+        if (advisory.explicit_bucket_boundaries == null) return error.NoBucketBoundaries;
+        return self.internalCreateObservable(
+            api.metrics.HistogramPoint,
+            .{
+                .name = api.metrics.validateInstrumentName(name),
+                .unit = api.metrics.validateInstrumentUnit(unit) orelse "",
+                .instrument_type = .ObservableHistogram,
+            },
+            api.metrics.validateInstrumentDescription(description),
+            advisory,
+            callbacks,
+        );
+    }
+
     fn internalCreateObservable(
         self: *Meter,
         comptime T: type,
@@ -529,7 +556,8 @@ pub const Meter = struct {
         const observable_map = switch (T) {
             i64 => &self.observables_i64,
             f64 => &self.observables_f64,
-            else => @compileError("ObservableInstrument must be of type i64 or f64"),
+            api.metrics.HistogramPoint => &self.observables_histogram,
+            else => @compileError("ObservableInstrument must be of type i64, f64 or HistogramPoint"),
         };
 
         // Check if identical instrument already exists
@@ -590,8 +618,16 @@ pub const Meter = struct {
         return .{ .bridge = .init(self) };
     }
 
+    /// Runs every observable instrument's callbacks, in a fixed order: histograms, then
+    /// i64 instruments, then f64 ones, each kind in the order its instruments were created.
+    /// A callback may rely on an earlier one having run in the same collection.
     pub fn triggerObservables(self: *const Meter, allocator: std.mem.Allocator, reader: sdk.metrics.Reader) void {
         // TODO this whole struct is missing a mutex? maybe 2: one for observables and one for sync instruments.
+
+        var iter_histogram = self.observables_histogram.iterator();
+        while (iter_histogram.next()) |entry| {
+            entry.value_ptr.*.triggerObserve(allocator, reader);
+        }
 
         var iter_i64 = self.observables_i64.iterator();
         while (iter_i64.next()) |entry| {

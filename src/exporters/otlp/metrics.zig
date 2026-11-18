@@ -11,6 +11,7 @@ const MetricDataPoint = otel_sdk.metrics.MetricDataPoint;
 const MetricType = otel_sdk.metrics.MetricType;
 const MetricExporter = otel_sdk.metrics.MetricExporter;
 const convert = @import("convert.zig");
+const transport = @import("transport.zig");
 
 // Import error handler for structured error reporting
 const error_handler = otel_api.common;
@@ -20,6 +21,9 @@ const metrics_v1 = @import("proto/opentelemetry/proto/metrics/v1.pb.zig");
 const common_v1 = @import("proto/opentelemetry/proto/common/v1.pb.zig");
 const resource_v1 = @import("proto/opentelemetry/proto/resource/v1.pb.zig");
 
+/// Exports metrics as OTLP/HTTP protobuf through the shared transport: every POST has the
+/// config's timeout, retries stay inside its export budget, and nothing is held while the
+/// request is out. A reader calls it from one thread at a time.
 pub const OtlpMetricExporter = struct {
     pub const PipelineStep = otel_sdk.common.PipelineStepInstructions(
         Self,
@@ -37,8 +41,22 @@ pub const OtlpMetricExporter = struct {
 
     config: OtlpExporterConfig,
     allocator: std.mem.Allocator,
-    is_shutdown: bool = false,
-    mutex: std.Io.Mutex = std.Io.Mutex.init,
+    is_shutdown: std.atomic.Value(bool) = .init(false),
+    /// The last export failed: an outage is reported once, not once per export.
+    failing: std.atomic.Value(bool) = .init(false),
+    exports_ok: std.atomic.Value(u64) = .init(0),
+    exports_failed: std.atomic.Value(u64) = .init(0),
+    last_export_ns: std.atomic.Value(u64) = .init(0),
+    last_export_bytes: std.atomic.Value(u64) = .init(0),
+
+    /// What the exporter has done so far, for an application that exports it as metrics.
+    pub const Stats = struct {
+        exports_ok: u64,
+        exports_failed: u64,
+        /// The last export: its POST(s), start to answer, and its body.
+        last_export_ns: u64,
+        last_export_bytes: u64,
+    };
 
     pub fn init(allocator: std.mem.Allocator, config: OtlpExporterConfig) OtlpMetricExporter {
         return .{
@@ -55,41 +73,74 @@ pub const OtlpMetricExporter = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn exportMetrics(self: *OtlpMetricExporter, metrics: []const MetricData) ExportResult {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
+    pub fn stats(self: *const OtlpMetricExporter) Stats {
+        return .{
+            .exports_ok = self.exports_ok.load(.monotonic),
+            .exports_failed = self.exports_failed.load(.monotonic),
+            .last_export_ns = self.last_export_ns.load(.monotonic),
+            .last_export_bytes = self.last_export_bytes.load(.monotonic),
+        };
+    }
 
-        if (self.is_shutdown) {
+    pub fn exportMetrics(self: *OtlpMetricExporter, metrics: []const MetricData) ExportResult {
+        return self.exportMetricsWithin(metrics, null);
+    }
+
+    /// `exportMetrics` with the config's timeouts cut to `timeout_ms` (a reader's shutdown
+    /// budget).
+    pub fn exportMetricsWithin(self: *OtlpMetricExporter, metrics: []const MetricData, timeout_ms: ?u64) ExportResult {
+        if (self.is_shutdown.load(.acquire)) {
             return .failure;
         }
+        if (metrics.len == 0) return .success;
 
-        var metrics_data = convertToOtlpFormat(self.allocator, metrics) catch |err| {
-            const first_metric_name = if (metrics.len > 0) metrics[0].name else "(no metrics)";
-            error_handler.reportError(.{
-                .component = .exporter,
-                .operation = "otlp_metric_serialization",
-                .error_type = .serialization,
-                .message = "OTLP metrics conversion failed",
-                .context = first_metric_name,
-                .source_error = err,
-            });
-            return .failure;
-        };
-        defer metrics_data.deinit(self.allocator);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
 
-        self.sendRequest(self.allocator, metrics_data) catch |err| {
-            error_handler.reportError(.{
+        const result = self.send(allocator, metrics, timeout_ms) catch |err| {
+            self.failed(.{
                 .component = .exporter,
-                .operation = "otlp_metric_network",
-                .error_type = .network,
-                .message = "OTLP metrics network request failed",
+                .operation = "otlp_metric_export",
+                .error_type = if (err == error.OutOfMemory) .serialization else .network,
+                .message = "OTLP metrics export failed (not reported again until one succeeds)",
                 .context = self.config.endpoint,
                 .source_error = err,
             });
             return .failure;
         };
-
+        if (result != .success) {
+            // an HTTP error status: the transport reported it
+            _ = self.exports_failed.fetchAdd(1, .monotonic);
+            self.failing.store(true, .release);
+            return result;
+        }
+        _ = self.exports_ok.fetchAdd(1, .monotonic);
+        self.failing.store(false, .release);
         return .success;
+    }
+
+    fn failed(self: *OtlpMetricExporter, info: error_handler.ErrorInfo) void {
+        _ = self.exports_failed.fetchAdd(1, .monotonic);
+        if (!self.failing.swap(true, .acq_rel)) error_handler.reportError(info);
+    }
+
+    fn send(self: *OtlpMetricExporter, allocator: std.mem.Allocator, metrics: []const MetricData, timeout_ms: ?u64) !ExportResult {
+        const metrics_data = try convertToOtlpFormat(allocator, metrics);
+        var buffer = std.Io.Writer.Allocating.init(allocator);
+        metrics_data.encode(&buffer.writer, allocator) catch return error.OutOfMemory;
+        const payload = buffer.written();
+        self.last_export_bytes.store(payload.len, .monotonic);
+
+        var config = self.config;
+        if (timeout_ms) |limit| {
+            config.timeout_millis = @min(config.timeout_millis, limit);
+            config.export_timeout_millis = @min(config.export_timeout_millis, limit);
+        }
+        const url = try transport.signalUrl(allocator, config, config.protocol_config.metrics_path);
+        const started = std.Io.Timestamp.now(config.io, .awake).nanoseconds;
+        defer self.last_export_ns.store(@intCast(@max(std.Io.Timestamp.now(config.io, .awake).nanoseconds - started, 0)), .monotonic);
+        return transport.post(self.allocator, allocator, config, url, "application/x-protobuf", config.headers, payload, "metrics");
     }
 
     pub fn forceFlush(self: *OtlpMetricExporter, timeout_ms: ?u64) ExportResult {
@@ -101,11 +152,8 @@ pub const OtlpMetricExporter = struct {
     }
 
     pub fn shutdown(self: *OtlpMetricExporter, timeout_ms: ?u64) ExportResult {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-
         _ = timeout_ms;
-        self.is_shutdown = true;
+        self.is_shutdown.store(true, .release);
         return .success;
     }
 
@@ -113,80 +161,6 @@ pub const OtlpMetricExporter = struct {
         return .{
             .bridge = otel_sdk.metrics.BridgeMetricExporter.init(self),
         };
-    }
-
-    fn sendRequest(self: *OtlpMetricExporter, allocator: std.mem.Allocator, metrics_data: metrics_v1.MetricsData) !void {
-        var client = std.http.Client{ .allocator = allocator, .io = io };
-        defer client.deinit();
-
-        // Serialize to binary protobuf
-        var buffer = std.Io.Writer.Allocating.init(allocator);
-        defer buffer.deinit();
-        try metrics_data.encode(&buffer.writer, allocator);
-        const protobuf_bytes = try buffer.toOwnedSlice();
-        defer allocator.free(protobuf_bytes);
-
-        // Parse endpoint URL with detailed error context
-        const base_uri = std.Uri.parse(self.config.endpoint) catch |err| {
-            error_handler.reportError(.{
-                .component = .exporter,
-                .operation = "otlp_metric_url_parsing",
-                .error_type = .configuration,
-                .message = "OTLP metrics URL parsing failed",
-                .context = self.config.endpoint,
-                .source_error = err,
-            });
-            return err;
-        };
-
-        // Build full URL with metrics path
-        const host_str = switch (base_uri.host.?) {
-            .raw => |raw| raw,
-            .percent_encoded => |encoded| encoded,
-        };
-        const scheme_str = if (base_uri.scheme.len > 0) base_uri.scheme else "http";
-        const full_url = try std.fmt.allocPrint(allocator, "{s}://{s}:{d}{s}", .{ scheme_str, host_str, base_uri.port orelse 4318, self.config.protocol_config.metrics_path });
-        defer allocator.free(full_url);
-
-        // Add custom headers from config (simplified approach)
-        var extra_headers = try allocator.alloc(std.http.Header, self.config.headers.len);
-        defer allocator.free(extra_headers);
-        for (self.config.headers, 0..) |header, h| {
-            extra_headers[h] = header;
-        }
-
-        // Create HTTP request
-        const full_uri = try std.Uri.parse(full_url);
-        var req = try client.request(.POST, full_uri, .{
-            .headers = .{
-                .content_type = .{ .override = "application/x-protobuf" },
-                .user_agent = .{ .override = "otel-zig-otlp" },
-            },
-            .extra_headers = extra_headers,
-        });
-        defer req.deinit();
-
-        // Set request headers
-        req.transfer_encoding = .{ .content_length = @intCast(protobuf_bytes.len) };
-
-        // Send request
-        var bw = try req.sendBodyUnflushed(&.{});
-        try bw.writer.writeAll(protobuf_bytes);
-        try bw.end();
-        try req.connection.?.flush();
-
-        const res = try req.receiveHead(&.{});
-
-        if (res.head.status != .ok) {
-            error_handler.reportError(.{
-                .component = .exporter,
-                .operation = "otlp_metric_response",
-                .error_type = .authentication,
-                .message = "OTLP metrics export failed with HTTP error",
-                .context = self.config.endpoint,
-            });
-            return error.ExportFailed;
-        }
     }
 };
 
@@ -198,6 +172,14 @@ pub fn createMetricExporterWithConfig(config: OtlpExporterConfig, allocator: std
     return exporter.metricsExporter();
 }
 
+fn temporalityToProto(t: otel_sdk.metrics.MetricData.Temporality) metrics_v1.AggregationTemporality {
+    return switch (t) {
+        .delta => .AGGREGATION_TEMPORALITY_DELTA,
+        .cumulative => .AGGREGATION_TEMPORALITY_CUMULATIVE,
+    };
+}
+
+/// `allocator` is an arena: the returned messages are freed with it.
 fn convertToOtlpFormat(allocator: std.mem.Allocator, metrics: []const MetricData) !metrics_v1.MetricsData {
     var resource_metrics_map = std.StringHashMap(std.ArrayList(MetricData)).init(allocator);
     defer {
@@ -263,8 +245,40 @@ fn convertToOtlpFormat(allocator: std.mem.Allocator, metrics: []const MetricData
                 .scope = try convert.instrumentationScopeToProto(allocator, scope_metrics.items[0].scope),
             };
 
+            // A reader hands over one MetricData per attribute set: the points of one
+            // instrument go into one Metric, by name (and the rest of what a Metric fixes).
+            var by_name = std.StringHashMap(usize).init(allocator);
+            defer by_name.deinit();
+
             // Convert metrics
             for (scope_metrics.items) |metric_data| {
+                const slot = try by_name.getOrPut(metric_data.name);
+                if (slot.found_existing) {
+                    const existing = &sm.metrics.items[slot.value_ptr.*];
+                    const merged = switch (existing.data.?) {
+                        .sum => |*sum| metric_data.type == .sum and sum.aggregation_temporality == temporalityToProto(metric_data.temporality) and sum.is_monotonic == metric_data.is_monotonic and blk: {
+                            var points = try convertNumberDataPoints(allocator, metric_data.data_points);
+                            try sum.data_points.appendSlice(allocator, points.items);
+                            points.deinit(allocator);
+                            break :blk true;
+                        },
+                        .gauge => |*gauge| metric_data.type == .gauge and blk: {
+                            var points = try convertNumberDataPoints(allocator, metric_data.data_points);
+                            try gauge.data_points.appendSlice(allocator, points.items);
+                            points.deinit(allocator);
+                            break :blk true;
+                        },
+                        .histogram => |*histogram| metric_data.type == .histogram and histogram.aggregation_temporality == temporalityToProto(metric_data.temporality) and blk: {
+                            var points = try convertHistogramDataPoints(allocator, metric_data.data_points);
+                            try histogram.data_points.appendSlice(allocator, points.items);
+                            points.deinit(allocator);
+                            break :blk true;
+                        },
+                        else => false,
+                    };
+                    if (merged) continue;
+                } else slot.value_ptr.* = sm.metrics.items.len;
+
                 var metric = metrics_v1.Metric{
                     .name = try allocator.dupe(u8, metric_data.name),
                     .description = try allocator.dupe(u8, metric_data.description orelse ""),
@@ -275,7 +289,8 @@ fn convertToOtlpFormat(allocator: std.mem.Allocator, metrics: []const MetricData
                 switch (metric_data.type) {
                     .sum => {
                         metric.data = .{ .sum = .{
-                            .aggregation_temporality = .AGGREGATION_TEMPORALITY_DELTA,
+                            .aggregation_temporality = temporalityToProto(metric_data.temporality),
+                            .is_monotonic = metric_data.is_monotonic,
                             .data_points = try convertNumberDataPoints(allocator, metric_data.data_points),
                         } };
                     },
@@ -286,7 +301,7 @@ fn convertToOtlpFormat(allocator: std.mem.Allocator, metrics: []const MetricData
                     },
                     .histogram => {
                         metric.data = .{ .histogram = .{
-                            .aggregation_temporality = .AGGREGATION_TEMPORALITY_DELTA,
+                            .aggregation_temporality = temporalityToProto(metric_data.temporality),
                             .data_points = try convertHistogramDataPoints(allocator, metric_data.data_points),
                         } };
                     },
@@ -552,3 +567,113 @@ const golden_metric_hex =
     "62651100f08461159c97171900002a36fe9c971721060000000000000029000000000080394032200200000000000000" ++
     "0300000000000000010000000000000000000000000000003a18000000000000f03f0000000000001440000000000000" ++
     "244059000000000000e03f6166666666666622401001";
+
+const TestServer = @import("test_server.zig").TestServer;
+
+/// Two points of one counter (as a reader hands them over: a MetricData each) and a
+/// cumulative sum, on a resource named "svc".
+const fork_resource_attrs = [_]otel_api.common.AttributeKeyValue{.{ .key = "service.name", .value = .{ .string = "svc" } }};
+const fork_get = [_]otel_api.common.AttributeKeyValue{.{ .key = "route", .value = .{ .string = "/a" } }};
+const fork_post = [_]otel_api.common.AttributeKeyValue{.{ .key = "route", .value = .{ .string = "/b" } }};
+fn forkMetrics() [3]MetricData {
+    const resource = otel_sdk.resource.Resource{ .attributes = &fork_resource_attrs };
+    const scope = otel_api.InstrumentationScope{ .name = "scope" };
+    const point = struct {
+        fn of(attrs: []const otel_api.common.AttributeKeyValue, v: i64) [1]MetricDataPoint {
+            return .{.{ .attributes = attrs, .timestamp_ns = 2000, .start_timestamp_ns = 1000, .value = .{ .i64_sum = v } }};
+        }
+    }.of;
+    const S = struct {
+        const a = point(&fork_get, 3);
+        const b = point(&fork_post, 4);
+        const c = point(&fork_get, 9);
+    };
+    return .{
+        .{ .resource = resource, .scope = scope, .name = "requests", .description = null, .unit = "1", .type = .sum, .data_points = &S.a, .is_monotonic = true },
+        .{ .resource = resource, .scope = scope, .name = "requests", .description = null, .unit = "1", .type = .sum, .data_points = &S.b, .is_monotonic = true },
+        .{ .resource = resource, .scope = scope, .name = "level", .description = null, .unit = "1", .type = .sum, .data_points = &S.c, .temporality = .cumulative },
+    };
+}
+
+test "fork: an export goes to the endpoint's own port and path, with its resource, temporality and one Metric per instrument" {
+    const testing = std.testing;
+    var server: TestServer = undefined;
+    try server.start(testing.io);
+    defer server.stop();
+    var url_buf: [64]u8 = undefined;
+    var exporter = OtlpMetricExporter.init(testing.allocator, .{ .endpoint = server.url(&url_buf), .io = testing.io, .timeout_millis = 2000, .export_timeout_millis = 2000, .retry_config = .{ .enabled = false } });
+    const metrics = forkMetrics();
+    try testing.expectEqual(ExportResult.success, exporter.exportMetrics(&metrics));
+    const st = exporter.stats();
+    try testing.expectEqual(@as(u64, 1), st.exports_ok);
+    try testing.expectEqual(@as(u64, 0), st.exports_failed);
+    try testing.expect(st.last_export_bytes > 0 and st.last_export_ns > 0);
+
+    const got = try server.last(testing.allocator);
+    defer testing.allocator.free(got.path);
+    defer testing.allocator.free(got.body);
+    try testing.expectEqualStrings("/v1/metrics", got.path);
+    try testing.expectEqual(@as(usize, st.last_export_bytes), got.body.len);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var reader: std.Io.Reader = .fixed(got.body);
+    const decoded = try metrics_v1.MetricsData.decode(&reader, arena.allocator());
+    const rm = decoded.resource_metrics.items[0];
+    try testing.expectEqualStrings("service.name", rm.resource.?.attributes.items[0].key);
+    try testing.expectEqualStrings("svc", rm.resource.?.attributes.items[0].value.?.value.?.string_value);
+    const exported = rm.scope_metrics.items[0].metrics.items;
+    try testing.expectEqual(@as(usize, 2), exported.len);
+    for (exported) |m| {
+        const sum = m.data.?.sum;
+        if (std.mem.eql(u8, m.name, "requests")) {
+            try testing.expectEqual(@as(usize, 2), sum.data_points.items.len);
+            try testing.expect(sum.is_monotonic);
+            try testing.expectEqual(metrics_v1.AggregationTemporality.AGGREGATION_TEMPORALITY_DELTA, sum.aggregation_temporality);
+        } else {
+            try testing.expectEqualStrings("level", m.name);
+            try testing.expect(!sum.is_monotonic);
+            try testing.expectEqual(metrics_v1.AggregationTemporality.AGGREGATION_TEMPORALITY_CUMULATIVE, sum.aggregation_temporality);
+        }
+    }
+
+    // after shutdown, nothing is sent
+    _ = exporter.shutdown(null);
+    try testing.expectEqual(ExportResult.failure, exporter.exportMetrics(&metrics));
+    try testing.expectEqual(@as(usize, 1), server.requests.load(.monotonic));
+}
+
+var fork_reported: std.atomic.Value(u32) = .init(0);
+fn forkCountErrors(_: error_handler.ErrorInfo, _: ?std.mem.Allocator) void {
+    _ = fork_reported.fetchAdd(1, .monotonic);
+}
+
+test "fork: a collector that never answers costs an export its timeout, and an outage is reported once" {
+    const testing = std.testing;
+    var server: TestServer = undefined;
+    try server.start(testing.io);
+    defer server.stop();
+    server.hang.store(true, .release);
+    var url_buf: [64]u8 = undefined;
+    var exporter = OtlpMetricExporter.init(testing.allocator, .{ .endpoint = server.url(&url_buf), .io = testing.io, .timeout_millis = 200, .export_timeout_millis = 200, .retry_config = .{ .enabled = false } });
+    const metrics = forkMetrics();
+
+    fork_reported.store(0, .monotonic);
+    error_handler.setGlobalErrorHandler(forkCountErrors);
+    defer error_handler.setGlobalErrorHandler(null);
+    var t0 = std.Io.Timestamp.now(testing.io, .awake).nanoseconds;
+    try testing.expectEqual(ExportResult.failure, exporter.exportMetrics(&metrics));
+    var took_ms = @divFloor(std.Io.Timestamp.now(testing.io, .awake).nanoseconds - t0, std.time.ns_per_ms);
+    try testing.expect(took_ms >= 150 and took_ms < 1500);
+
+    // a reader's shutdown budget cuts the timeout further
+    exporter.config.timeout_millis = 5000;
+    exporter.config.export_timeout_millis = 5000;
+    t0 = std.Io.Timestamp.now(testing.io, .awake).nanoseconds;
+    try testing.expectEqual(ExportResult.failure, exporter.exportMetricsWithin(&metrics, 150));
+    took_ms = @divFloor(std.Io.Timestamp.now(testing.io, .awake).nanoseconds - t0, std.time.ns_per_ms);
+    try testing.expect(took_ms < 1500);
+
+    try testing.expectEqual(@as(u64, 2), exporter.stats().exports_failed);
+    try testing.expectEqual(@as(u32, 1), fork_reported.load(.monotonic));
+}

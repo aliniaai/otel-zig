@@ -15,6 +15,7 @@ pub const Aggregation = union(enum) {
     last_value_f64: LastValueAggregation(f64),
     histogram_i64: HistogramAggregation(i64),
     histogram_f64: HistogramAggregation(f64),
+    observed_histogram: ObservedHistogram,
     drop: void, // Drop aggregation - ignores all measurements
 
     // Add a measurement to this aggregation (lock-free)
@@ -37,6 +38,7 @@ pub const Aggregation = union(enum) {
             .last_value_f64 => |*lv| if (T == f64) lv.record(value) else unreachable,
             .histogram_i64 => |*h| if (T == i64) h.record(value) else unreachable,
             .histogram_f64 => |*h| if (T == f64) h.record(value) else unreachable,
+            .observed_histogram => unreachable, // created holding its observation
             .drop => {}, // Intentionally do nothing
         }
         return true;
@@ -50,6 +52,7 @@ pub const Aggregation = union(enum) {
             .last_value_f64 => |*s| s.reset(),
             .histogram_i64 => |*s| s.reset(),
             .histogram_f64 => |*s| s.reset(),
+            .observed_histogram => {},
             .drop => {},
         }
     }
@@ -59,8 +62,34 @@ pub const Aggregation = union(enum) {
         switch (self.*) {
             .histogram_i64 => |*h| h.deinit(allocator),
             .histogram_f64 => |*h| h.deinit(allocator),
+            .observed_histogram => |*h| allocator.free(h.bucket_counts),
             else => {}, // Other aggregations don't need cleanup
         }
+    }
+};
+
+/// One collection's observation of an ObservableHistogram attribute set: the running totals
+/// its callback reported. The reader turns them into its temporality.
+pub const ObservedHistogram = struct {
+    /// The instrument's; not owned.
+    boundaries: []const f64,
+    /// Owned.
+    bucket_counts: []u64,
+    sum: f64,
+    min: ?f64,
+    max: ?f64,
+
+    pub const Error = error{ BucketCountMismatch, OutOfMemory };
+
+    pub fn init(allocator: std.mem.Allocator, boundaries: []const f64, point: @import("otel-api").metrics.HistogramPoint) Error!ObservedHistogram {
+        if (point.bucket_counts.len != boundaries.len + 1) return error.BucketCountMismatch;
+        return .{
+            .boundaries = boundaries,
+            .bucket_counts = try allocator.dupe(u64, point.bucket_counts),
+            .sum = point.sum,
+            .min = point.min,
+            .max = point.max,
+        };
     }
 };
 
@@ -120,35 +149,33 @@ pub fn SumAggregation(comptime T: type) type {
 }
 
 /// Aggregation state for last value aggregation
+///
+/// harbor's fork: 64-bit atomics only. Upstream packed the optional value into one u128
+/// atomic, which x86_64 without cmpxchg16b (`-Dcpu=baseline`) cannot compile.
 pub fn LastValueAggregation(comptime T: type) type {
     return struct {
-        // zig doesn't support `?(i64|f64)` with atomic.
-        // zig only supports powers of 2 for the bit length with atomic.
-        /// the 65th bit is the optional flag; 0 == null; 1 == value
-        value: std.atomic.Value(u128) = .init(0),
+        /// The value's bits; meaningful once `set`.
+        bits: std.atomic.Value(u64) = .init(0),
+        /// Stored after `bits` (release), read before it (acquire).
+        set: std.atomic.Value(bool) = .init(false),
 
         pub fn init() @This() {
-            return .{
-                .value = .init(0),
-            };
+            return .{};
         }
 
         pub fn record(self: *@This(), value: T) void {
-            const bits: u64 = @bitCast(value);
-            const guarded: u128 = @as(u128, bits) | (1 << 64);
-            self.value.store(guarded, .monotonic);
+            self.bits.store(@bitCast(value), .monotonic);
+            self.set.store(true, .release);
         }
 
         pub fn getValue(self: *const @This()) ?T {
-            const guarded = self.value.load(.monotonic);
-            return if (guarded & (1 << 64) == 0)
-                null
-            else
-                @bitCast(@as(u64, @truncate(guarded)));
+            if (!self.set.load(.acquire)) return null;
+            return @bitCast(self.bits.load(.monotonic));
         }
 
         pub fn reset(self: *@This()) void {
-            self.value.store(0, .monotonic);
+            self.set.store(false, .monotonic);
+            self.bits.store(0, .monotonic);
         }
     };
 }
@@ -163,9 +190,31 @@ pub fn HistogramAggregation(comptime T: type) type {
         start_timestamp_ns: u64,
         record_min_max: bool,
 
-        // similar to LastValueAggregation, no support of optionals.
-        min: std.atomic.Value(u128) = .init(0),
-        max: std.atomic.Value(u128) = .init(0),
+        // harbor's fork: the bits of the least and greatest value recorded, starting from the
+        // values no record can pass (`no_min`, `no_max`); `count`, published after them, says
+        // whether there is one. 64-bit atomics only: upstream's u128 optionals need cmpxchg16b,
+        // which x86_64 `-Dcpu=baseline` lacks.
+        min: std.atomic.Value(u64) = .init(@bitCast(no_min)),
+        max: std.atomic.Value(u64) = .init(@bitCast(no_max)),
+
+        const no_min: T = if (T == f64) std.math.inf(f64) else std.math.maxInt(T);
+        const no_max: T = if (T == f64) -std.math.inf(f64) else std.math.minInt(T);
+
+        /// Moves `slot` to `value` while `better(value, current)`.
+        fn improve(slot: *std.atomic.Value(u64), value: T, comptime better: fn (T, T) bool) void {
+            var current = slot.load(.monotonic);
+            while (better(value, @bitCast(current))) {
+                current = slot.cmpxchgWeak(current, @bitCast(value), .monotonic, .monotonic) orelse return;
+            }
+        }
+
+        fn lower(a: T, b: T) bool {
+            return a < b;
+        }
+
+        fn higher(a: T, b: T) bool {
+            return a > b;
+        }
 
         pub fn init(allocator: std.mem.Allocator, config: HistogramAggregationConfig) !@This() {
             const counts = try allocator.alloc(std.atomic.Value(u64), config.boundaries.len + 1);
@@ -186,45 +235,15 @@ pub fn HistogramAggregation(comptime T: type) type {
         }
 
         pub fn record(self: *@This(), value: T) void {
-            // Atomic operations for sum and count
-            _ = self.count.fetchAdd(1, .monotonic);
             _ = self.sum.fetchAdd(value, .monotonic);
-
             if (self.record_min_max) {
-                // Simple atomic min/max
-                const bits: u64 = @bitCast(value);
-                const value_guarded: u128 = @as(u128, bits) | (1 << 64);
-
-                // min will always be "decreasing", even if it changes
-                var expected_guarded = value_guarded;
-                while (self.min.cmpxchgWeak(expected_guarded, value_guarded, .acq_rel, .monotonic)) |new_expected| {
-                    if (new_expected & (1 << 64) == 0) {
-                        // new_expected was null, so retry to set the first value
-                        expected_guarded = new_expected;
-                    } else {
-                        // new_expected is a value, so we have to compare before we can try again.
-                        const expected: T = @bitCast(@as(u64, @truncate(new_expected)));
-                        if (value >= expected) break; // Min is already lower than our value.
-                        expected_guarded = new_expected;
-                    }
-                }
-
-                expected_guarded = value_guarded;
-                while (self.max.cmpxchgWeak(expected_guarded, value_guarded, .acq_rel, .monotonic)) |new_expected| {
-                    if (new_expected & (1 << 64) == 0) {
-                        // new_expected was null, so retry to set the first value
-                        expected_guarded = new_expected;
-                    } else {
-                        // new_expected is a value, so we have to compare before we can try again.
-                        const expected: T = @bitCast(@as(u64, @truncate(new_expected)));
-                        if (value <= expected) break; // Max is already higher than our value.
-                        expected_guarded = new_expected;
-                    }
-                }
+                improve(&self.min, value, lower);
+                improve(&self.max, value, higher);
             }
-
             const bucket_index = self.findBucketIndex(value);
             _ = self.counts[bucket_index].fetchAdd(1, .monotonic);
+            // after min and max: a reader that sees the count sees them
+            _ = self.count.fetchAdd(1, .release);
         }
 
         pub fn findBucketIndex(self: *const @This(), value: T) usize {
@@ -271,19 +290,13 @@ pub fn HistogramAggregation(comptime T: type) type {
         }
 
         pub fn getMin(self: *const @This()) ?T {
-            const guarded = self.min.load(.monotonic);
-            return if (guarded & (1 << 64) == 0)
-                null
-            else
-                @bitCast(@as(u64, @truncate(guarded)));
+            if (!self.record_min_max or self.count.load(.acquire) == 0) return null;
+            return @bitCast(self.min.load(.monotonic));
         }
 
         pub fn getMax(self: *const @This()) ?T {
-            const guarded = self.max.load(.monotonic);
-            return if (guarded & (1 << 64) == 0)
-                null
-            else
-                @bitCast(@as(u64, @truncate(guarded)));
+            if (!self.record_min_max or self.count.load(.acquire) == 0) return null;
+            return @bitCast(self.max.load(.monotonic));
         }
 
         pub fn getBoundaries(self: *const @This()) []const f64 {
@@ -304,8 +317,8 @@ pub fn HistogramAggregation(comptime T: type) type {
             }
             self.sum.store(0, .monotonic);
             self.count.store(0, .monotonic);
-            self.min.store(0, .monotonic);
-            self.max.store(0, .monotonic);
+            self.min.store(@bitCast(no_min), .monotonic);
+            self.max.store(@bitCast(no_max), .monotonic);
             self.start_timestamp_ns = @intCast(std.Io.Timestamp.now(io, .real).nanoseconds);
         }
     };

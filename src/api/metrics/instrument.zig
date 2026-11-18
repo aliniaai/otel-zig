@@ -33,6 +33,9 @@ pub const InstrumentType = enum {
     ObservableCounter,
     ObservableUpDownCounter,
     ObservableGauge,
+    /// Not in the OpenTelemetry API: a histogram whose buckets the application keeps and a
+    /// callback reports (observable_instrument.zig `HistogramPoint`).
+    ObservableHistogram,
 };
 
 const BaseType = enum {

@@ -98,14 +98,20 @@ pub const ManualReader = struct {
 
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        self.collectLocked(allocator);
+    }
 
+    /// Under the mutex.
+    fn collectLocked(self: *ManualReader, allocator: std.mem.Allocator) void {
         // trigger the observables to write their data to the aggregation state.
         for (self.registered_meters.items) |meter| {
             meter.triggerObservables(allocator, self.reader());
         }
 
-        // Collect all the aggregated metrics.
-        const collected_metrics = self.reader_state.collect(allocator) catch |err| {
+        // Collect all the aggregated metrics, tagged with the provider's resource (every
+        // meter of a reader is its provider's).
+        const resource = if (self.registered_meters.items.len > 0) self.registered_meters.items[0].provider.resource else sdk.Resource.empty;
+        const collected_metrics = self.reader_state.collect(allocator, resource) catch |err| {
             std.log.err("Failed to collect metrics: {}", .{err});
             // Log error if needed
             return;
@@ -113,31 +119,43 @@ pub const ManualReader = struct {
         defer allocator.free(collected_metrics);
 
         // Export all collected metrics. Exporter must copy memory
-        // that it needs beyond the duration of this call.
-        if (self.exporter) |*exporter| _ = exporter.exportMetrics(collected_metrics);
+        // that it needs beyond the duration of this call. One that fails is not committed:
+        // the next collection's observable deltas cover it.
+        const result: api.common.ExportResult = if (self.exporter) |*exporter| exporter.exportMetrics(collected_metrics) else .success;
+        if (result == .success) self.reader_state.commit();
         // Arena cleans up all the memory.
     }
 
+    /// Collect and export now, then flush the exporter.
     pub fn forceFlush(self: *ManualReader, timeout_ms: ?u64) api.common.FlushResult {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
 
         if (self.is_shutdown) {
             return .failure;
         }
+        self.collectLocked(arena.allocator());
 
         // Flush the exporter
         const result = if (self.exporter) |*exporter| exporter.forceFlush(timeout_ms) else .success;
         return result.asFlushResult();
     }
 
+    /// A last collection, then the exporter's shutdown.
     pub fn shutdown(self: *ManualReader, timeout_ms: ?u64) api.common.ProcessResult {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
 
         if (self.is_shutdown) {
             return .success;
         }
+        self.collectLocked(arena.allocator());
 
         self.is_shutdown = true;
 

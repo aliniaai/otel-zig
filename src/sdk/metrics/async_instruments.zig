@@ -29,8 +29,8 @@ const sdk = struct {
 /// aggregations, not to the instrument.
 pub fn Observable(comptime T: type) type {
     comptime switch (T) {
-        i64, f64 => {},
-        else => @compileError("ObservableInstrument must be of type i64 or f64"),
+        i64, f64, api.metrics.HistogramPoint => {},
+        else => @compileError("ObservableInstrument must be of type i64, f64 or HistogramPoint"),
     };
 
     return struct {
@@ -353,6 +353,7 @@ pub fn Observable(comptime T: type) type {
                         switch (T) {
                             i64 => .{ .i64 = measurement.value },
                             f64 => .{ .f64 = measurement.value },
+                            api.metrics.HistogramPoint => .{ .histogram = measurement.value },
                             else => unreachable,
                         },
                         attrs,

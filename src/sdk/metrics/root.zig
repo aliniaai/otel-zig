@@ -48,5 +48,6 @@ pub const setupGlobalProviderWithViews = @import("setup.zig").setupGlobalProvide
 
 test {
     _ = @import("test.zig");
+    _ = @import("harbor_test.zig");
     std.testing.refAllDecls(@This());
 }

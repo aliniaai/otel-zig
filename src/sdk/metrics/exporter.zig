@@ -19,9 +19,15 @@ pub const MetricExporter = union(enum) {
     /// the memory when this function returns. That includes making deep copies if
     /// necessary for buffering.
     pub fn exportMetrics(self: *const MetricExporter, metrics: []const sdk.MetricData) api.common.ExportResult {
+        return self.exportMetricsWithin(metrics, null);
+    }
+
+    /// `exportMetrics`, to be over within `timeout_ms` when the exporter can bound itself
+    /// (one that declares `exportMetricsWithin`); the others ignore it. null: its own limit.
+    pub fn exportMetricsWithin(self: *const MetricExporter, metrics: []const sdk.MetricData, timeout_ms: ?u64) api.common.ExportResult {
         return switch (self.*) {
             .noop => .success,
-            .bridge => |exporter| exporter.exportFn(exporter, metrics),
+            .bridge => |exporter| exporter.exportFn(exporter, metrics, timeout_ms),
         };
     }
 
@@ -60,7 +66,7 @@ pub const MetricExporter = union(enum) {
 
 pub const BridgeMetricExporter = struct {
     exporter_ptr: *anyopaque,
-    exportFn: *const fn (ptr: BridgeMetricExporter, metrics: []const sdk.MetricData) api.common.ExportResult,
+    exportFn: *const fn (ptr: BridgeMetricExporter, metrics: []const sdk.MetricData, timeout_ms: ?u64) api.common.ExportResult,
     forceFlushFn: *const fn (ptr: BridgeMetricExporter, timeout_ms: ?u64) api.common.ExportResult,
     shutdownFn: *const fn (ptr: BridgeMetricExporter, timeout_ms: ?u64) api.common.ExportResult,
     deinitFn: *const fn (self: BridgeMetricExporter) void,
@@ -71,8 +77,9 @@ pub const BridgeMetricExporter = struct {
         const ptr_info = @typeInfo(T);
 
         const VTable = struct {
-            pub fn exportMetrics(self: BridgeMetricExporter, metrics: []const sdk.MetricData) api.common.ExportResult {
+            pub fn exportMetrics(self: BridgeMetricExporter, metrics: []const sdk.MetricData, timeout_ms: ?u64) api.common.ExportResult {
                 const actual_self: T = @ptrCast(@alignCast(self.exporter_ptr));
+                if (@hasDecl(ptr_info.pointer.child, "exportMetricsWithin")) return ptr_info.pointer.child.exportMetricsWithin(actual_self, metrics, timeout_ms);
                 return ptr_info.pointer.child.exportMetrics(actual_self, metrics);
             }
             pub fn forceFlush(self: BridgeMetricExporter, timeout_ms: ?u64) api.common.ExportResult {
@@ -207,6 +214,8 @@ pub const MockMetricExporter = struct {
             .data_points = points,
             .scope = metric_data.scope,
             .resource = metric_data.resource,
+            .temporality = metric_data.temporality,
+            .is_monotonic = metric_data.is_monotonic,
         });
     }
 

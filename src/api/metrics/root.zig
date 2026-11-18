@@ -31,6 +31,7 @@ pub const InstrumentType = instrument_zig.InstrumentType;
 const observable_instrument_zig = @import("observable_instrument.zig");
 pub const ObservableInstrument = observable_instrument_zig.ObservableInstrument;
 pub const ObservableResult = observable_instrument_zig.ObservableResult;
+pub const HistogramPoint = observable_instrument_zig.HistogramPoint;
 pub const ObservableCallback = observable_instrument_zig.ObservableCallback;
 pub const CallbackHandle = observable_instrument_zig.CallbackHandle;
 pub const TypeErasedCallback = observable_instrument_zig.TypeErasedCallback;

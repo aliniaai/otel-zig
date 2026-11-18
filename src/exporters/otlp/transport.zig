@@ -217,12 +217,16 @@ fn performWithTimeout(
     // timeout was left asleep had that task wake into the retry's select and
     // abort the process from std.Io.Threaded's group accounting.
     defer pending.cancelDiscard();
-    pending.async(.request, Run.run, .{ client_allocator, allocator, config, url, uri, content_type, extra_headers, payload, timeout_ms });
-    pending.async(.timeout, std.Io.sleep, .{
+    // harbor: `concurrent`, not `async`: async runs a task inline once the Io's pool is busy,
+    // and an inline timeout sleeps its whole duration after the request has answered. An Io
+    // with no concurrency at all runs the request alone, untimed.
+    pending.concurrent(.request, Run.run, .{ client_allocator, allocator, config, url, uri, content_type, extra_headers, payload, timeout_ms }) catch
+        return Run.run(client_allocator, allocator, config, url, uri, content_type, extra_headers, payload, timeout_ms);
+    pending.concurrent(.timeout, std.Io.sleep, .{
         config.io,
         .{ .nanoseconds = @intCast(timeout_ms *| std.time.ns_per_ms) },
         .awake,
-    });
+    }) catch {};
     return switch (try pending.await()) {
         .request => |request_result| request_result,
         .timeout => error.Timeout,
@@ -335,4 +339,24 @@ test "a request that fails outright does not leave its timeout running into the 
     }, url, "application/x-protobuf", &.{}, "payload", "logs");
     try testing.expectEqual(ExportResult.success, try result);
     try collector.await(io);
+}
+
+test "post: an Io with no async capacity left does not sleep out the timeout after the answer" {
+    // `Io.async` runs a task inline once the pool is busy (the limit is the CPU count less
+    // one: none on a 2-CPU host with one export in flight). Inline, the timeout's sleep ran
+    // to its end after the request had answered.
+    const testing = std.testing;
+    const TestServer = @import("test_server.zig").TestServer;
+    var server: TestServer = undefined;
+    try server.start(testing.io);
+    defer server.stop();
+    var threaded: std.Io.Threaded = .init(testing.allocator, .{ .async_limit = .nothing });
+    defer threaded.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/v1/metrics", .{server.port});
+    const config: OtlpExporterConfig = .{ .endpoint = url, .io = threaded.io(), .timeout_millis = 2000, .export_timeout_millis = 2000, .retry_config = .{ .enabled = false } };
+    const t0 = std.Io.Timestamp.now(testing.io, .awake).nanoseconds;
+    try testing.expectEqual(ExportResult.success, try post(testing.allocator, testing.allocator, config, url, "application/x-protobuf", &.{}, "x", "metrics"));
+    try testing.expect(std.Io.Timestamp.now(testing.io, .awake).nanoseconds - t0 < 1000 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 1), server.requests.load(.monotonic));
 }

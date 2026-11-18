@@ -32,6 +32,10 @@ pub const MeterProvider = struct {
     views: std.ArrayListUnmanaged(sdk.metrics.View),
     mutex: std.Io.Mutex,
     is_shutdown: std.atomic.Value(bool),
+    /// How the meters created from now on run observable callbacks. The default measures
+    /// every callback with instruments of the global provider and warns when one observes
+    /// nothing; `.production` does neither.
+    async_config: @import("async_instruments.zig").AsyncInstrumentConfig = .default,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -109,7 +113,13 @@ pub const MeterProvider = struct {
             }
         }
 
-        const result = self.forceFlush(timeout.remaining() catch return .timeout).asProcessResult();
+        // Each reader's shutdown runs its last collection and export. They are taken out of
+        // the mutex one at a time: a reader's export must not hold up `getMeterWithScope`.
+        var result: api.common.ProcessResult = .success;
+        for (self.readers.items) |*reader| {
+            const r = reader.shutdown(timeout.remaining() catch return .timeout);
+            if (!r.isSuccess()) result = r;
+        }
         if (result.isSuccess()) self.is_shutdown.store(true, .monotonic);
         return result;
     }
@@ -120,10 +130,9 @@ pub const MeterProvider = struct {
 
         const timeout = sdk.common.Timeout.init(timeout_ms);
 
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
+        // No provider mutex: the readers are fixed after start-up, and a flush is a network
+        // call. A reader's forceFlush collects before it flushes.
         for (self.readers.items) |*reader| {
-            reader.collect();
             const flush_result = reader.forceFlush(timeout.remaining() catch return .timeout);
             switch (flush_result) {
                 .success => {},
@@ -240,6 +249,10 @@ pub const MeterProvider = struct {
             },
             .Histogram => switch (aggregation_type) {
                 .histogram, .sum, .drop => true, // Histograms can be aggregated as sums
+                else => false,
+            },
+            .ObservableHistogram => switch (aggregation_type) {
+                .histogram, .drop => true,
                 else => false,
             },
         };

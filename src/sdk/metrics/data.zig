@@ -3,6 +3,7 @@ const api = @import("otel-api");
 const sdk = struct {
     const Resource = @import("../resource/resource.zig").Resource;
 };
+pub const AggregationTemporality = @import("aggregations.zig").AggregationTemporality;
 
 /// Metric data point representing a single measurement
 pub const MetricDataPoint = struct {
@@ -108,6 +109,13 @@ pub const MetricData = struct {
     scope: api.InstrumentationScope,
     /// Resource associated with this metric
     resource: sdk.Resource,
+    /// What a sum's or a histogram's points cover: the change since their start timestamp
+    /// (`delta`) or the running total (`cumulative`). Unused for a gauge.
+    temporality: AggregationTemporality = .delta,
+    /// A sum that only grows (a Counter, an ObservableCounter).
+    is_monotonic: bool = false,
+
+    pub const Temporality = AggregationTemporality;
 
     /// Formats the metric data into a human-readable string
     pub fn format(
